@@ -1,0 +1,315 @@
+widget "nostr" {
+  page: 2
+  order: 2
+  size: 3x3
+  minSize: 3x2
+  meta { description: "Your nostr inbox: new zaps, replies, mentions, reactions and reposts. Enter any npub or NIP-05 address; tap for the full list"; version: "1.0"; license: "MIT"; category: "news"; owl: 5 }
+  requires { pacman: ["websocat", "jq", "curl"] }
+
+  state who = "" persist          // the npub, nprofile, hex key or NIP-05 address entered
+  state seen = 0 persist          // everything after this time is new
+  state alerts = true persist     // notify on new zaps
+  state tab = "all"
+  state amberAt = 0               // when Amber was last asked to decrypt the mute list (NIP-46)
+  source now = clock every 1m
+
+  // Only these characters reach the shell.
+  let id = lower(trim(who))
+  let valid = id != "" && match(id, "^[a-z0-9@._-]+$") != null
+
+  // Finds the user's key and inbox relays (NIP-65), then the last week's zaps, notes, reactions
+  // and reposts that tag them, with the names of who sent them. Reads only public data; no keys needed.
+  source inbox = cmd('id=' + (valid ? id : "") + ';' + '
+# Prints the nostr inbox of $id (npub, nprofile, hex or NIP-05) as one line of JSON.
+[ -z "$id" ] && { echo null; exit 0; }
+t=$(mktemp -d); trap "rm -f $t/*; rmdir $t" EXIT
+c=~/.cache/nostr-inbox; mkdir -p $c
+# q relay filter secs: the EVENT lines one relay sends before EOSE.
+q() { { printf "[\"REQ\",\"w\",%s]\n" "$2"; sleep $3; } | timeout $(($3 + 2)) websocat -E "$1" 2>/dev/null | awk "/^.\"EOSE/{exit} /^.\"EVENT/{print}"; }
+# qa filter secs relays...: q on every relay at once, all their events in one list.
+qa() { local f=$1 s=$2 i=0 r; shift 2; for r in "$@"; do q "$r" "$f" $s > $t/q$i & i=$((i + 1)); done; wait; cat $t/q* 2>/dev/null | jq -sc "map(.[2]) | unique_by(.id)"; rm -f $t/q*; }
+boot="wss://purplepag.es wss://relay.damus.io wss://nos.lol wss://relay.primal.net"
+
+case $id in
+  npub1* | nprofile1*)
+    pk=$(printf %s "$id" | jq -Rr --arg cs qpzry9x8gf2tvdw0s3jn54khce6mua7l -f <(cat <<"JQ"
+      def hex: . as $n | "0123456789abcdef" as $h | $h[($n / 16 | floor):($n / 16 | floor) + 1] + $h[($n % 16):($n % 16) + 1];
+      (if startswith("nprofile") then 2 else 0 end) as $skip
+      | split("1") | last | .[0:-6] | split("")
+      | [.[] as $ch | $cs | index($ch)]
+      | map([range(4; -1; -1) as $i | (. / pow(2; $i) | floor) % 2]) | flatten
+      | . as $b | [range(0; length / 8 | floor) | $b[. * 8:. * 8 + 8] | reduce .[] as $x (0; . * 2 + $x)]
+      | .[$skip:$skip + 32] | map(hex) | join("")
+JQ
+    )) ;;
+  *.*)
+    name=${id%@*}; dom=${id#*@}; [ "$name" = "$id" ] && name=_
+    pk=$(curl -sf -m 8 "https://$dom/.well-known/nostr.json?name=$name" | jq -r --arg n "$name" ".names[\$n] // empty") ;;
+  *) pk=$id ;;
+esac
+if ! [[ $pk =~ ^[0-9a-f]{64}$ ]]; then
+  jq -nc --arg id "$id" "{error: (if (\$id | contains(\".\")) then \"no nostr user at \" + \$id else \"not a valid npub\" end)}"
+  exit 0
+fi
+
+# The profile and relay list (NIP-65), cached for a day.
+if [ -n "$(find $c/$pk.json -mmin -1440 2>/dev/null)" ]; then
+  me=$(cat $c/$pk.json)
+else
+  me=$(qa "{\"kinds\":[0,10002],\"authors\":[\"$pk\"]}" 4 $boot | jq -c "
+    (map(select(.kind == 0)) | max_by(.created_at) | .content | fromjson? // {}) as \$p
+    | (map(select(.kind == 10002)) | max_by(.created_at) | .tags // []) as \$r
+    | {name: ([\$p.display_name, \$p.name] | map(select(. != null and . != \"\")) | first),
+       relays: [\$r[] | select(.[0] == \"r\" and (.[2] == null or .[2] == \"read\")) | .[1] | rtrimstr(\"/\")] | .[0:4]}")
+  [ -n "$me" ] && printf %s "$me" > $c/$pk.json
+fi
+[ -z "$me" ] && me="{}"
+relays=$(printf %s "$me" | jq -r "(.relays // []) + [\"wss://relay.damus.io\", \"wss://nos.lol\", \"wss://relay.primal.net\"] | unique | .[0:6] | .[]")
+
+# Zaps, replies, mentions, reposts and reactions tagging the user, last 7 days.
+since=$(($(date +%s) - 7 * 86400))
+p="\"#p\":[\"$pk\"],\"since\":$since"
+qa "{\"kinds\":[9735],$p,\"limit\":100},{\"kinds\":[1],$p,\"limit\":100},{\"kinds\":[6,7,16],$p,\"limit\":100},{\"kinds\":[10000],\"authors\":[\"$pk\"]}" 6 $relays > $t/ev.json
+# Private mutes: the signer (Amber, over NIP-46) decrypts this version of the list on request, see the widget.
+# The ciphertext goes to a file so it never becomes part of a command.
+jq -r --arg pk "$pk" "map(select(.kind == 10000 and .pubkey == \$pk)) | max_by(.created_at) | .content // empty" $t/ev.json > $c/$pk.cipher
+mid=$(jq -r --arg pk "$pk" "map(select(.kind == 10000 and .pubkey == \$pk)) | max_by(.created_at) | .id // empty" $t/ev.json)
+for f in $c/$pk.*.mutes.json; do [ -f "$f" ] && [ "$f" != "$c/$pk.$mid.mutes.json" ] && rm -f "$f"; done
+pf=$c/$pk.$mid.mutes.json; [ -s "$pf" ] || pf=/dev/null
+# NIP-46: a fixed client key and secret for this phone, and the nostrconnect:// link that pairs it with the signer.
+k=~/.config/nostr-inbox; connect=""
+if command -v nak > /dev/null; then
+  mkdir -p $k
+  [ -s $k/client.key ] || (umask 077; nak key generate > $k/client.key)
+  [ -s $k/connect.secret ] || (umask 077; nak key generate | cut -c1-16 > $k/connect.secret)
+  [ -s $k/relays ] || echo wss://relay.nip46.com wss://bucket.coracle.social wss://nrs.primal.net > $k/relays  # the NIP-46 relays Opal uses, minus the dead relay.nsec.app
+  connect="nostrconnect://$(nak key public $(cat $k/client.key))?$(for r in $(cat $k/relays); do printf "relay=%s&" $(printf %s $r | jq -Rr @uri); done)secret=$(cat $k/connect.secret)&perms=nip44_decrypt%2Cnip04_decrypt&name=nostr%20inbox"
+fi
+jq -c --arg pk "$pk" --slurpfile priv "$pf" --arg nak "$(command -v nak)" --arg bunker "$([ -s $k/bunker ] && echo yes)" --arg connect "$connect" -f <(cat <<"JQ"
+  def tag($k): [.tags[]? | select(.[0] == $k) | .[1]];
+  def sats(b): (b // "" | capture("^lnbc(?<n>[0-9]+)(?<m>[munp]?)1")? // null) as $c
+    | if $c == null then null else ($c.n | tonumber) * ({"m": 100000, "u": 100, "n": 0.1, "p": 0.0001, "": 100000000}[$c.m]) | floor end;
+  # Public NIP-51 mutes (kind 10000): people, threads, hashtags and words. Private ones are encrypted to the user.
+  (map(select(.kind == 10000 and .pubkey == $pk)) | max_by(.created_at)) as $ml
+  | ($priv[0] | if type == "array" then map(select(type == "array")) else null end) as $pt
+  | (($ml.tags // []) + ($pt // [])) as $mute
+  | [$mute[] | select(.[0] == "p") | .[1]] as $mp
+  | [$mute[] | select(.[0] == "e") | .[1]] as $me
+  | [$mute[] | select(.[0] == "t") | .[1] | ascii_downcase] as $mt
+  | [$mute[] | select(.[0] == "word") | .[1] | ascii_downcase | select(. != "")] as $mw
+  | map(select(.kind != 10000 and (.pubkey != $pk or .kind == 9735))) | length as $total
+  | map(select((any(tag("e")[]; IN($me[])) | not) and (any(tag("t")[] | ascii_downcase; IN($mt[])) | not)))
+  | map(
+    if .kind == 9735 then
+      (tag("description")[0] | fromjson? // {}) as $z
+      | {id, at: .created_at, type: "zap", who: ($z.pubkey // .pubkey), text: ($z.content // ""), ref: ((tag("e") | last) // .id),
+         sats: ((($z | tag("amount")[0] | tonumber?) // null | if . then ./1000 | floor else null end) // sats(tag("bolt11")[0]))}
+    elif .kind == 1 then {id, at: .created_at, type: (if (tag("e") | length) > 0 then "reply" else "mention" end), who: .pubkey, text: .content[0:400], ref: .id}
+    elif .kind == 7 then {id, at: .created_at, type: "reaction", who: .pubkey, text: .content[0:40], ref: ((tag("e") | last) // .id)}
+    else {id, at: .created_at, type: "repost", who: .pubkey, text: "", ref: ((tag("e") | last) // .id)} end)
+  | map(select((.who | IN($mp[]) | not) and ((.text | ascii_downcase) as $c | any($mw[]; . as $w | $c | contains($w)) | not)))
+  | {mutes: {id: $ml.id, private: (if ($ml.content // "") == "" then null elif $pt == null then -1 else ($pt | length) end),
+      nip04: (($ml.content // "") | contains("?iv=")), nak: ($nak != ""), bunker: ($bunker == "yes"), connect: (if $connect == "" then null else $connect end)},
+    muted: ($total - length), items: (group_by(.type) | map(sort_by(-.at) | .[0:40]) | add // [] | sort_by(-.at))}
+JQ
+) $t/ev.json > $t/items.json
+
+# NIP-21 links (nostr:nevent1…) so taps open in the phone nostr app; njump.me if nak is missing.
+if command -v nak > /dev/null; then jq -c --arg pk "$pk" ".items[] | {id: .ref, pubkey: (if .type == \"reply\" or .type == \"mention\" then .who else \$pk end)}" $t/items.json | nak encode nevent 2> /dev/null | jq -Rsc "split(\"\n\") | map(select(. != \"\"))" > $t/nev.json; fi
+[ -s $t/nev.json ] || echo "[]" > $t/nev.json
+
+# Names of the people in it.
+f=$(jq -r ".items | map(.who) | unique | .[0:100] | . as \$a | [range(0; length; 20) | {kinds: [0], authors: \$a[.:. + 20], limit: 100} | tojson] | join(\",\")" $t/items.json)
+qa "$f" 5 wss://purplepag.es wss://relay.ditto.pub wss://relay.primal.net wss://nos.lol > $t/names.json
+jq -nc --arg pk "$pk" --argjson me "$me" --slurpfile items $t/items.json --slurpfile ps $t/names.json --slurpfile nev $t/nev.json -f <(cat <<"JQ"
+  ($ps[0] | group_by(.pubkey) | map(max_by(.created_at) | {key: .pubkey, value: (.content | fromjson? // {} | [.display_name, .name] | map(select(type == "string" and . != "")) | first)}) | from_entries) as $names
+  | {pk: $pk, name: $me.name, relays: $me.relays, at: now | floor, muted: $items[0].muted, mutes: $items[0].mutes,
+     items: ($items[0].items | (length == ($nev[0] | length)) as $ok | to_entries | map(.value + {name: ($names[.value.who] // ("npub…" + .value.who[-6:])), nevent: (if $ok then $nev[0][.key] else null end)}))}
+JQ
+)
+') every 5m json timeout 60s status
+
+  let data = inbox.ok ? inbox.out : null
+  let items = data.items ?? []
+  let fresh = items.filter(i => i.at > seen)
+  let zaps = fresh.filter(i => i.type == "zap")
+  let sats = sum(zaps.map(z => z.sats ?? 0))
+  let talk = fresh.filter(i => i.type == "reply" || i.type == "mention")
+  let likes = fresh.filter(i => i.type == "reaction" || i.type == "repost")
+  let shown = (tab == "zaps" ? items.filter(i => i.type == "zap") : tab == "replies" ? items.filter(i => i.type == "reply" || i.type == "mention") : tab == "reactions" ? items.filter(i => i.type == "reaction" || i.type == "repost") : items).take(80)
+  let lastZap = items.find(i => i.type == "zap")
+  // Reactions: "+" or empty is a like; a :shortcode: is a custom emoji (NIP-30), drawn as a star.
+  component Glyph(it, size = 14) {
+    Text { text: it.type == "zap" ? "⚡" : it.type == "repost" ? "↻" : it.type != "reaction" ? "↩" : it.text == "+" || it.text == "" ? "♥" : startsWith(it.text, ":") ? "✦" : it.text; fontSize: size; color: it.type == "zap" ? yellow : it.type == "reaction" ? red : it.type == "repost" ? green : cyan; width: size + 10; align: center; maxLines: 1 }
+  }
+  // The decrypted private mutes are saved for this version of the list (hex ids from the script only).
+  let muteFile = "~/.cache/nostr-inbox/${data.pk}.${data.mutes.id}.mutes.json"
+  let cipherFile = "~/.cache/nostr-inbox/${data.pk}.cipher"
+  // Decrypts the mute list through the saved NIP-46 connection; the ciphertext is read from a file.
+  let decryptCmd = 'k=~/.config/nostr-inbox; NOSTR_CLIENT_KEY=$(cat $k/client.key) timeout 120 nak decrypt --sec "$(cat $k/bunker)" -p ' + data.pk + (data.mutes.nip04 ? ' --nip04' : '') + ' "$(cat ' + cipherFile + ')" > ' + muteFile + '.tmp && jq -e "type == \"array\"" ' + muteFile + '.tmp > /dev/null && mv ' + muteFile + '.tmp ' + muteFile + '; rm -f ' + muteFile + '.tmp'
+  let waiting = data.mutes.private == -1 && now - amberAt < 300
+  let zapKey = alerts ? lastZap.id : null
+
+  // Private mutes: when the list is still encrypted and Amber is paired, ask Amber to decrypt it (NIP-46).
+  when data.mutes.private == -1 && data.mutes.bunker { run(decryptCmd) }
+
+  on zapKey { notify("⚡ ${lastZap.name}", "zapped you ${lastZap.sats ?? "some"} sats${lastZap.text == "" ? "" : ": " + lastZap.text}") }
+
+  onTap: screen()
+
+  component Ago(t) {
+    Text { text: t == null ? "" : now - t < 3600 ? "${max(floor((now - t) / 60), 1)}m" : now - t < 86400 ? "${floor((now - t) / 3600)}h" : "${floor((now - t) / 86400)}d"; style: small; color: muted; align: end; maxLines: 1 }
+  }
+
+  component Count(glyph, value, note, tint) {
+    Column {
+      gap: 0
+      align: center
+      Text { text: "${glyph} ${value}"; style: title; color: value == 0 || value == "0" ? muted : tint; align: center; maxLines: 1 }
+      Text { text: note; style: label; color: muted; align: center; maxLines: 1 }
+    }
+  }
+
+  component Setup() {
+    Column {
+      gap: 6
+      Text { text: "nostr inbox"; style: label; color: magenta }
+      Text { text: "enter your npub or nip-05 address"; style: small; color: muted }
+      Input { text: who; placeholder: "npub or name@domain"; fontSize: 13; onSubmit: { who = trim(value); seen = now - 86400 } }
+    }
+  }
+
+  if who == "" {
+    Setup { }
+  } else if !valid || data.error != null {
+    Column {
+      gap: 6
+      Text { text: "nostr inbox"; style: label; color: magenta }
+      Text { text: valid ? data.error : "that doesn't look like an npub or name@domain"; style: small; color: red; maxLines: 3 }
+      Button { text: "change"; onTap: who = "" }
+    }
+  } else if data == null {
+    Column {
+      gap: 6
+      Text { text: "nostr inbox"; style: label; color: magenta }
+      Text { text: inbox == null ? "asking the relays…" : inbox.code == 124 ? "relays timed out, retrying" : "couldn't reach the relays"; style: small; color: muted }
+    }
+  } else {
+    Column {
+      gap: 4
+      Row {
+        align: center
+        Text { text: "nostr"; style: label; color: magenta; width: 52 }
+        Text { text: data.name ?? id; style: small; color: muted; align: end; maxLines: 1; weight: 1 }
+      }
+      Row {
+        gap: 4
+        Count { glyph: "⚡"; value: sats >= 1000 ? "${fixed(sats / 1000, 1)}k" : "${sats}"; note: "${len(zaps)} zaps"; tint: yellow; weight: 1 }
+        Count { glyph: "↩"; value: len(talk); note: "replies"; tint: cyan; weight: 1 }
+        Count { glyph: "♥"; value: len(likes); note: "reactions"; tint: red; weight: 1 }
+      }
+      Spacer { weight: 1 }
+      if len(fresh) == 0 {
+        Text { text: "all caught up"; style: small; color: muted; maxLines: 1 }
+      } else {
+        for i in fresh.take(rows >= 3 ? 3 : 1) key i.id {
+          Row {
+            gap: 6
+            Glyph { it: i }
+            Text { text: i.name; style: small; bold: true; maxLines: 1; width: cols >= 5 ? 150 : 90 }
+            Text { text: i.type == "zap" ? "${i.sats ?? "?"} sats${i.text == "" ? "" : " · " + i.text}" : i.type == "reaction" ? "reacted" : i.type == "repost" ? "reposted" : i.text; style: small; color: muted; maxLines: 1; weight: 1 }
+          }
+        }
+      }
+    }
+  }
+
+  screen {
+    title: "nostr inbox"
+    Column {
+      scroll: true
+      gap: 10
+      if data != null && data.error == null {
+        Row {
+          align: center
+          Column {
+            gap: 0
+            weight: 1
+            Text { text: data.name ?? id; style: title; maxLines: 1 }
+            Text { text: "${len(fresh)} new · ${len(zaps)} zaps · ${sats} sats"; style: small; color: muted; maxLines: 1 }
+          }
+          Button { text: "mark read"; onTap: seen = now }
+        }
+        Row {
+          gap: 6
+          for t in ["all", "zaps", "replies", "reactions"] {
+            Button { text: t; color: tab == t ? accent : muted; onTap: tab = t }
+          }
+        }
+        if len(shown) == 0 {
+          Text { text: "nothing in the last 7 days"; style: body; color: muted }
+        }
+        for i in shown key i.id {
+          Row {
+            gap: 10
+            padding: [8, 6]
+            background: i.at > seen ? alpha(magenta, 0.1) : alpha(muted, 0.04)
+            onTap: url(i.nevent != null ? "nostr:" + i.nevent : "https://njump.me/" + i.ref)
+            Glyph { it: i; size: 18 }
+            Column {
+              gap: 1
+              weight: 1
+              Row {
+                Text { text: i.name; style: body; bold: true; maxLines: 1; weight: 1 }
+                Ago { t: i.at; width: 40 }
+              }
+              Text { text: i.type == "zap" ? "zapped ${i.sats ?? "?"} sats" : i.type == "reply" ? "replied" : i.type == "mention" ? "mentioned you" : i.type == "repost" ? "reposted your note" : "reacted to your note"; style: small; color: muted; maxLines: 1 }
+              if i.text != "" && i.type != "reaction" {
+                Text { text: i.text; style: small; maxLines: 3 }
+              }
+            }
+          }
+        }
+        Spacer { height: 1; fill: width; background: alpha(muted, 0.25) }
+        Text { text: "account"; style: label; color: accent }
+        Input { text: who; placeholder: "npub1… or name@domain"; fontSize: 13; onSubmit: { who = trim(value); seen = now - 86400 } }
+        Row {
+          gap: 6
+          Button { text: alerts ? "zap alerts: on" : "zap alerts: off"; color: alerts ? accent : muted; onTap: alerts = !alerts }
+          Button { text: "refresh"; color: muted; onTap: refresh() }
+        }
+        // NIP-46 pairing with Amber, which decrypts the private part of the mute list (NIP-51).
+        if data.mutes.nak && data.mutes.private != null {
+          Row {
+            gap: 6
+            align: center
+            if data.mutes.bunker {
+              Text { text: "Amber connected"; style: small; color: muted; weight: 1 }
+              Button { text: "disconnect"; color: muted; onTap: run('rm -f ~/.config/nostr-inbox/bunker ~/.config/nostr-inbox/connect.secret ' + muteFile) }
+            } else {
+        // Listens for Amber's answer to the nostrconnect:// link (it must echo our secret), saves the
+        // connection, then decrypts right away. Opens the link in Amber at the same time.
+        Button {
+          text: "connect Amber"
+          onTap: {
+            amberAt = now
+            run('k=~/.config/nostr-inbox; ck=$(cat $k/client.key); relays=$(cat $k/relays); ev=$(timeout 280 nak req -k 24133 -p $(nak key public $ck) --since $(($(date +%s) - 5)) -l 1 --stream $relays 2>/dev/null); from=$(printf %s "$ev" | jq -r .pubkey); res=$(nak decrypt --sec $ck -p $from "$(printf %s "$ev" | jq -r .content)" 2>/dev/null | jq -r .result); [ -n "$res" ] && [ "$res" = "$(cat $k/connect.secret)" ] && (umask 077; printf %s "bunker://$from?$(for r in $relays; do printf "relay=%s&" $(printf %s $r | jq -Rr @uri); done)" > $k/bunker); [ -s $k/bunker ] && ' + decryptCmd)
+            url(data.mutes.connect)
+          }
+        }
+        // If Android stopped the listener while Amber was open: Amber signs as the user, so pair with their key.
+        if amberAt > 0 {
+          Button { text: "done in Amber"; color: muted; onTap: run('k=~/.config/nostr-inbox; [ -s $k/bunker ] || (umask 077; printf %s "bunker://' + data.pk + '?$(for r in $(cat $k/relays); do printf "relay=%s&" $(printf %s $r | jq -Rr @uri); done)" > $k/bunker); ' + decryptCmd) }
+        }
+            }
+          }
+        }
+        if data.relays != null {
+          Text { text: "relays: ${join(data.relays, ", ")}"; style: label; color: muted }
+        }
+      } else {
+        Setup { }
+      }
+    }
+  }
+}
